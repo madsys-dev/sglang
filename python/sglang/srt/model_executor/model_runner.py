@@ -511,14 +511,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
+        # MTP speculative decoding can run with PP on the target model as long as
+        # the draft side keeps full MTP layers local to the last PP stage.
+        if self.is_draft_worker and model_has_mtp_layers and (not self.spec_algorithm.is_none()):
+            assert self.num_effective_layers == model_num_layers, (
+                "Draft worker must own all MTP layers when speculative decoding is enabled."
             )
-        ), "PP is not compatible with MTP models."
 
         # Consider PP, so use start_layer and end_layer.
         full_attention_layer_ids = [

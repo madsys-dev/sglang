@@ -2507,7 +2507,16 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
-        if self.pp_group.is_first_rank:
+        speculative_algo = SpeculativeAlgorithm.from_string(
+            get_global_server_args().speculative_algorithm
+        )
+        keep_embed_on_last_pp_stage = (
+            self.pp_group.world_size > 1
+            and self.pp_group.is_last_rank
+            and speculative_algo.is_eagle()
+        )
+
+        if self.pp_group.is_first_rank or keep_embed_on_last_pp_stage:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

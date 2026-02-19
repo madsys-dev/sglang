@@ -518,9 +518,30 @@ class Scheduler(
             self.draft_worker = None
             return
 
+        if self.pp_size > 1 and self.spec_algorithm.is_eagle():
+            arch = self.model_config.hf_config.architectures[0]
+            if not arch.startswith("Deepseek"):
+                raise ValueError(
+                    "PP + EAGLE speculative decoding is currently only fully supported "
+                    f"for Deepseek architectures. Got: {arch}"
+                )
+
+        # Under PP, speculative draft worker only needs to run on the last stage.
+        if self.pp_size > 1 and self.pp_rank != self.pp_size - 1:
+            self.draft_worker = None
+            return
+
+        draft_server_args = self.server_args
+        if self.pp_size > 1:
+            import copy
+
+            draft_server_args = copy.deepcopy(self.server_args)
+            # Keep draft/MTP model local to one PP stage.
+            draft_server_args.pp_size = 1
+
         # Launch a draft worker for speculative decoding
         draft_worker_kwargs = dict(
-            server_args=self.server_args,
+            server_args=draft_server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
@@ -529,15 +550,15 @@ class Scheduler(
             dp_rank=self.dp_rank,
         )
 
-        if self.server_args.speculative_draft_load_format is not None:
-            self.server_args.load_format = (
-                self.server_args.speculative_draft_load_format
+        if draft_server_args.speculative_draft_load_format is not None:
+            draft_server_args.load_format = (
+                draft_server_args.speculative_draft_load_format
             )
             logger.info(
-                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
+                f"Using draft model load_format: '{draft_server_args.speculative_draft_load_format}'"
             )
 
-        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        DraftWorkerClass = self.spec_algorithm.create_worker(draft_server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
     def init_model_worker(self):
@@ -545,7 +566,7 @@ class Scheduler(
         self.maybe_init_draft_worker()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker

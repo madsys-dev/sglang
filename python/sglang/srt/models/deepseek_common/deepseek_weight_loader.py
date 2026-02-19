@@ -45,6 +45,8 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
@@ -258,8 +260,18 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # For EAGLE + PP, keep a copy of embed tokens on last stage so
+                        # draft worker running on last PP stage can share embed/head from target.
+                        keep_embed_on_last_pp_stage = (
+                            self.pp_group.world_size > 1
+                            and self.pp_group.is_last_rank
+                            and SpeculativeAlgorithm.from_string(
+                                get_global_server_args().speculative_algorithm
+                            ).is_eagle()
+                        )
+                        if ".embed_tokens." in name and not (
+                            self.pp_group.is_first_rank or keep_embed_on_last_pp_stage
+                        ):
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
