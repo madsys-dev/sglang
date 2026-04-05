@@ -347,10 +347,10 @@ impl LoadMonitor {
         loop {
             interval_timer.tick().await;
 
-            let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
+            let external_load_policies = policy_registry.get_all_external_load_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if external_load_policies.is_empty() {
+                debug!("No load-aware policies found, skipping load fetch");
                 continue;
             }
 
@@ -363,11 +363,11 @@ impl LoadMonitor {
 
             if !loads.is_empty() {
                 debug!(
-                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                    "Fetched loads from {} workers, updating {} load-aware policies",
                     loads.len(),
-                    power_of_two_policies.len()
+                    external_load_policies.len()
                 );
-                for policy in &power_of_two_policies {
+                for policy in &external_load_policies {
                     policy.update_loads(&loads);
                 }
                 let _ = tx.send(loads);
