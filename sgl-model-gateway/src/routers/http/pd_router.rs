@@ -628,6 +628,13 @@ impl PDRouter {
                 if context.is_stream {
                     // Prefill has completed at this point. Release its load now so
                     // long decode streams do not keep prefill marked as busy.
+                    //
+                    // Why not keep prefill guard on the streaming response body?
+                    // - Prefill work is already finished before we return the stream.
+                    // - Holding prefill guard until stream end inflates prefill load and
+                    //   can mislead imbalance detection in cache-aware/pd scheduling.
+                    // - Decode guard still remains attached to stream lifecycle to reflect
+                    //   actual ongoing decode work (including long streams / client aborts).
                     prefill_guard.take();
 
                     // Streaming response
@@ -888,7 +895,9 @@ impl PDRouter {
         let body = Body::from_stream(stream);
 
         // For streaming requests, only decode load should be tied to stream lifecycle.
-        // Prefill load is released as soon as prefill response completes.
+        // Prefill load is released in execute_dual_dispatch_internal immediately after
+        // prefill completion. Keeping prefill guard here would intentionally delay
+        // release until stream end, which is incorrect for PD prefill capacity tracking.
         let guards = vec![WorkerLoadGuard::new(decode, request_headers)];
 
         let mut response = Response::new(body);
