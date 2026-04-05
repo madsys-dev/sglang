@@ -419,7 +419,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -454,7 +453,6 @@ impl PDRouter {
                 context.return_logprob,
                 Some(decode_url),
                 Some(response_headers),
-                prefill,
                 decode,
             )
         } else {
@@ -539,10 +537,10 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        // Track prefill load for both streaming and non-streaming requests.
+        // For streaming, prefill should be released immediately after prefill completes.
+        let mut prefill_guard = Some(WorkerLoadGuard::new(prefill.clone(), headers));
+        // Decode load is held until response completion (or stream end/abort).
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
@@ -596,7 +594,7 @@ impl PDRouter {
                     );
 
                     return self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
                 }
 
@@ -625,6 +623,10 @@ impl PDRouter {
                 };
 
                 if context.is_stream {
+                    // Prefill has completed at this point. Release its load now so
+                    // long decode streams do not keep prefill marked as busy.
+                    prefill_guard.take();
+
                     // Streaming response
                     let prefill_logprobs = if context.return_logprob {
                         prefill_body
@@ -646,7 +648,6 @@ impl PDRouter {
                         context.return_logprob,
                         None,
                         Some(response_headers),
-                        prefill,
                         decode,
                     )
                 } else {
@@ -839,7 +840,6 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -882,10 +882,9 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        // For streaming requests, only decode load should be tied to stream lifecycle.
+        // Prefill load is released as soon as prefill response completes.
+        let guards = vec![WorkerLoadGuard::new(decode, headers.as_ref())];
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -1550,20 +1549,19 @@ mod tests {
                 false,
                 None,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only decode load is attached to the streaming response lifecycle.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load stays 1 while response body exists.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
@@ -1572,7 +1570,7 @@ mod tests {
             drop(response);
         }
 
-        // Guards dropped when response dropped
+        // Decode guard dropped when response dropped.
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }
