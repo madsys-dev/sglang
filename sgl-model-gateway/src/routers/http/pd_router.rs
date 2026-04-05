@@ -452,6 +452,7 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(decode_url),
+                context.headers.as_ref(),
                 Some(response_headers),
                 decode,
             )
@@ -537,6 +538,8 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
+        let request_headers = headers.cloned();
+
         // Track prefill load for both streaming and non-streaming requests.
         // For streaming, prefill should be released immediately after prefill completes.
         let mut prefill_guard = Some(WorkerLoadGuard::new(prefill.clone(), headers));
@@ -647,6 +650,7 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         None,
+                        request_headers.as_ref(),
                         Some(response_headers),
                         decode,
                     )
@@ -839,7 +843,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         decode_url: Option<String>,
-        headers: Option<HeaderMap>,
+        request_headers: Option<&HeaderMap>,
+        response_headers: Option<HeaderMap>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -884,12 +889,12 @@ impl PDRouter {
 
         // For streaming requests, only decode load should be tied to stream lifecycle.
         // Prefill load is released as soon as prefill response completes.
-        let guards = vec![WorkerLoadGuard::new(decode, headers.as_ref())];
+        let guards = vec![WorkerLoadGuard::new(decode, request_headers)];
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
-        let mut response_headers = headers.unwrap_or_default();
+        let mut response_headers = response_headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -1547,6 +1552,7 @@ mod tests {
                 StatusCode::OK,
                 None,
                 false,
+                None,
                 None,
                 None,
                 decode_ref.clone(),
