@@ -59,7 +59,10 @@
     during the next eviction cycle.
 */
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -84,6 +87,8 @@ use crate::core::{Worker, UNKNOWN_MODEL_ID};
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// Cached load information from external monitoring (/get_load num_tokens sum).
+    cached_loads: RwLock<HashMap<String, isize>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
 }
@@ -124,6 +129,7 @@ impl CacheAwarePolicy {
         Self {
             config,
             trees,
+            cached_loads: RwLock::new(HashMap::new()),
             mesh_sync: None,
             _eviction_task: eviction_task,
         }
@@ -288,6 +294,7 @@ impl CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         request_text: &Option<&str>,
         healthy_indices: &[usize],
+        effective_loads: &[(usize, isize)],
         model_id: &str,
         max_load: usize,
         min_load: usize,
@@ -303,10 +310,11 @@ impl CacheAwarePolicy {
         }
 
         // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
+        let min_load_idx = effective_loads
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+            .min_by_key(|(_, load)| *load)
+            .map(|(idx, _)| *idx)
+            .or_else(|| healthy_indices.first().copied())?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -364,12 +372,42 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
+        // Resolve effective loads using the same fallback semantics as PowerOfTwoPolicy:
+        // 1) Prefer cached external token loads only when ALL compared workers have entries.
+        // 2) If any worker is missing external load data, fallback to local request counters for ALL workers.
+        let load_guard = self.cached_loads.read().ok();
+        let token_loads: Option<Vec<(usize, Option<isize>)>> = load_guard.as_ref().map(|m| {
+            healthy_indices
+                .iter()
+                .map(|&idx| (idx, m.get(workers[idx].url()).copied()))
+                .collect()
         });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let effective_loads: Vec<(usize, isize)> = match token_loads {
+            Some(loads) if loads.iter().all(|(_, l)| l.is_some()) => loads
+                .into_iter()
+                .map(|(idx, l)| (idx, l.unwrap()))
+                .collect(),
+            _ => healthy_indices
+                .iter()
+                .map(|&idx| (idx, workers[idx].load() as isize))
+                .collect(),
+        };
+
+        let (min_load_i, max_load_i) = effective_loads
+            .iter()
+            .fold((isize::MAX, isize::MIN), |(min, max), (_, load)| {
+                (min.min(*load), max.max(*load))
+            });
+        let min_load = if min_load_i == isize::MAX {
+            0
+        } else {
+            min_load_i.max(0) as usize
+        };
+        let max_load = if max_load_i == isize::MIN {
+            0
+        } else {
+            max_load_i.max(0) as usize
+        };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
@@ -380,6 +418,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 workers,
                 &request_text,
                 &healthy_indices,
+                &effective_loads,
                 model_id,
                 max_load,
                 min_load,
@@ -413,10 +452,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
                 // Low cache match: use worker with minimum load
-                healthy_indices
+                effective_loads
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
+                    .min_by_key(|(_, load)| *load)
+                    .map(|(idx, _)| *idx)
             };
 
             if let Some(idx) = selected_idx {
@@ -490,6 +529,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
     fn name(&self) -> &'static str {
         "cache_aware"
+    }
+
+    fn update_loads(&self, loads: &HashMap<String, isize>) {
+        if let Ok(mut cached) = self.cached_loads.write() {
+            *cached = loads.clone();
+        }
     }
 
     fn needs_request_text(&self) -> bool {
