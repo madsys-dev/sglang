@@ -419,7 +419,6 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
@@ -453,8 +452,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(decode_url),
+                context.headers.as_ref(),
                 Some(response_headers),
-                prefill,
                 decode,
             )
         } else {
@@ -539,10 +538,12 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+        let request_headers = headers.cloned();
+
+        // Track prefill load for both streaming and non-streaming requests.
+        // For streaming, prefill should be released immediately after prefill completes.
+        let mut prefill_guard = Some(WorkerLoadGuard::new(prefill.clone(), headers));
+        // Decode load is held until response completion (or stream end/abort).
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
@@ -596,7 +597,7 @@ impl PDRouter {
                     );
 
                     return self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
                 }
 
@@ -625,6 +626,17 @@ impl PDRouter {
                 };
 
                 if context.is_stream {
+                    // Prefill has completed at this point. Release its load now so
+                    // long decode streams do not keep prefill marked as busy.
+                    //
+                    // Why not keep prefill guard on the streaming response body?
+                    // - Prefill work is already finished before we return the stream.
+                    // - Holding prefill guard until stream end inflates prefill load and
+                    //   can mislead imbalance detection in cache-aware/pd scheduling.
+                    // - Decode guard still remains attached to stream lifecycle to reflect
+                    //   actual ongoing decode work (including long streams / client aborts).
+                    prefill_guard.take();
+
                     // Streaming response
                     let prefill_logprobs = if context.return_logprob {
                         prefill_body
@@ -645,8 +657,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         None,
+                        request_headers.as_ref(),
                         Some(response_headers),
-                        prefill,
                         decode,
                     )
                 } else {
@@ -838,8 +850,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         decode_url: Option<String>,
-        headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
+        request_headers: Option<&HeaderMap>,
+        response_headers: Option<HeaderMap>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         use crate::core::AttachedBody;
@@ -882,15 +894,16 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        // For streaming requests, only decode load should be tied to stream lifecycle.
+        // Prefill load is released in execute_dual_dispatch_internal immediately after
+        // prefill completion. Keeping prefill guard here would intentionally delay
+        // release until stream end, which is incorrect for PD prefill capacity tracking.
+        let guards = vec![WorkerLoadGuard::new(decode, request_headers)];
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
-        let mut response_headers = headers.unwrap_or_default();
+        let mut response_headers = response_headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -1550,20 +1563,20 @@ mod tests {
                 false,
                 None,
                 None,
-                prefill_ref.clone(),
+                None,
                 decode_ref.clone(),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only decode load is attached to the streaming response lifecycle.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load stays 1 while response body exists.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
@@ -1572,7 +1585,7 @@ mod tests {
             drop(response);
         }
 
-        // Guards dropped when response dropped
+        // Decode guard dropped when response dropped.
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }
