@@ -358,7 +358,12 @@ impl LoadMonitor {
 
             let mut loads = HashMap::new();
             for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
+                // Keep only valid non-negative token loads.
+                // Failed /get_load calls return -1 and should be treated as missing
+                // so policies can fallback to local request counters.
+                if load_info.load >= 0 {
+                    loads.insert(load_info.worker, load_info.load);
+                }
             }
 
             if !loads.is_empty() {
@@ -372,7 +377,15 @@ impl LoadMonitor {
                 }
                 let _ = tx.send(loads);
             } else {
-                warn!("No loads fetched from workers");
+                warn!(
+                    "No valid worker loads fetched (successful: {}, failed: {}), clearing cached external loads",
+                    result.successful,
+                    result.failed
+                );
+                for policy in &power_of_two_policies {
+                    policy.update_loads(&loads);
+                }
+                let _ = tx.send(loads);
             }
         }
     }
