@@ -65,7 +65,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
@@ -292,15 +292,8 @@ impl CacheAwarePolicy {
         max_load: usize,
         min_load: usize,
     ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
-            );
-        }
+        let worker_loads: Vec<(&str, usize)> =
+            workers.iter().map(|w| (w.url(), w.load())).collect();
 
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
@@ -341,6 +334,14 @@ impl CacheAwarePolicy {
 
         // Increment processed counter
         workers[min_load_idx].increment_processed();
+        info!(
+            selected_worker = workers[min_load_idx].url(),
+            policy_reason = "load",
+            max_load,
+            min_load,
+            worker_loads = ?worker_loads,
+            "Cache-aware policy selected worker"
+        );
 
         Some(min_load_idx)
     }
@@ -404,22 +405,30 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let (selected_idx, selection_reason) = if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
                 let tenant_url: &str = &result.tenant;
-                workers
-                    .iter()
-                    .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
+                (
+                    workers
+                        .iter()
+                        .position(|w| w.url() == tenant_url)
+                        .filter(|&idx| workers[idx].is_healthy()),
+                    "cache_aware",
+                )
             } else {
                 // Low cache match: use worker with minimum load
-                healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
+                (
+                    healthy_indices
+                        .iter()
+                        .min_by_key(|&&idx| workers[idx].load())
+                        .copied(),
+                    "cache_aware",
+                )
             };
 
             if let Some(idx) = selected_idx {
+                let worker_loads: Vec<(&str, usize)> =
+                    workers.iter().map(|w| (w.url(), w.load())).collect();
                 // Update the tree with this request (use worker URL directly, no allocation)
                 tree.insert(text, workers[idx].url());
 
@@ -438,6 +447,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
                 // Increment processed counter
                 workers[idx].increment_processed();
+                info!(
+                    selected_worker = workers[idx].url(),
+                    policy_reason = selection_reason,
+                    match_rate,
+                    cache_threshold = self.config.cache_threshold,
+                    max_load,
+                    min_load,
+                    worker_loads = ?worker_loads,
+                    "Cache-aware policy selected worker"
+                );
 
                 return Some(idx);
             }
