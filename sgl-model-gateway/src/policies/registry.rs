@@ -294,6 +294,51 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
+    /// Get all policies that consume externally sampled worker loads.
+    ///
+    /// Currently includes:
+    /// - power_of_two
+    /// - cache_aware
+    pub fn get_all_external_load_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut policies = Vec::new();
+
+        let should_include = |name: &str| name == "power_of_two" || name == "cache_aware";
+
+        if should_include(self.default_policy.name()) {
+            policies.push(Arc::clone(&self.default_policy));
+        }
+
+        let prefill_policy_opt = self.prefill_policy.get();
+        let decode_policy_opt = self.decode_policy.get();
+
+        if let Some(policy) = prefill_policy_opt {
+            if should_include(policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
+                policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(policy) = decode_policy_opt {
+            if should_include(policy.name())
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                policies.push(Arc::clone(policy));
+            }
+        }
+
+        for entry in self.model_policies.iter() {
+            let policy = entry.value();
+            if should_include(policy.name()) {
+                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
+                if !already_added {
+                    policies.push(Arc::clone(policy));
+                }
+            }
+        }
+
+        policies
+    }
+
     /// Initialize cache-aware policy with workers if applicable
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
