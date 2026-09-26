@@ -303,6 +303,10 @@ struct CliArgs {
     #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
+    /// Maximum concurrent prefill requests in PD mode (-1 to disable)
+    #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
+    max_prefill_concurrent_requests: i32,
+
     /// Queue size for pending requests when limit reached
     #[arg(long, default_value_t = 100, help_heading = "Rate Limiting")]
     queue_size: usize,
@@ -973,6 +977,7 @@ impl CliArgs {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
+            .max_prefill_concurrent_requests(self.max_prefill_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())

@@ -41,6 +41,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub prefill_rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -73,6 +74,7 @@ pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    prefill_rate_limiter: Option<Arc<TokenBucket>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -113,6 +115,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
+            prefill_rate_limiter: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -142,6 +145,11 @@ impl AppContextBuilder {
 
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub fn prefill_rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
+        self.prefill_rate_limiter = rate_limiter;
         self
     }
 
@@ -249,6 +257,7 @@ impl AppContextBuilder {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            prefill_rate_limiter: self.prefill_rate_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError("tokenizer_registry"))?,
@@ -293,6 +302,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
+            .maybe_prefill_rate_limiter(&router_config)
             .with_tokenizer_registry(&router_config)?
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
@@ -385,6 +395,15 @@ impl AppContextBuilder {
                     rate_limit_tokens as usize,
                 )))
             }
+        };
+        self
+    }
+
+    /// Create prefill stage concurrency limiter for PD mode
+    fn maybe_prefill_rate_limiter(mut self, config: &RouterConfig) -> Self {
+        self.prefill_rate_limiter = match config.max_prefill_concurrent_requests {
+            n if n <= 0 => None,
+            n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
         };
         self
     }

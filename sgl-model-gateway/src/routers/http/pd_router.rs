@@ -52,6 +52,8 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub prefill_rate_limiter: Option<Arc<crate::middleware::TokenBucket>>,
+    pub queue_timeout_secs: u64,
 }
 
 #[derive(Clone)]
@@ -63,6 +65,38 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+struct PrefillLimiterGuard<'a> {
+    limiter: Option<&'a crate::middleware::TokenBucket>,
+    acquired: bool,
+}
+
+impl<'a> PrefillLimiterGuard<'a> {
+    fn new(limiter: Option<&'a crate::middleware::TokenBucket>) -> Self {
+        Self {
+            limiter,
+            acquired: limiter.is_some(),
+        }
+    }
+
+    fn release_now(&mut self, reason: &'static str) {
+        if !self.acquired {
+            return;
+        }
+        if let Some(limiter) = self.limiter {
+            limiter.return_tokens_sync(1.0);
+            debug!("Released prefill limiter token reason={}", reason);
+        }
+        self.acquired = false;
+    }
+}
+
+impl Drop for PrefillLimiterGuard<'_> {
+    fn drop(&mut self) {
+        // Fallback release path for cancellation/early-return/panic safety.
+        self.release_now("guard_drop");
+    }
 }
 
 impl PDRouter {
@@ -165,6 +199,8 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            prefill_rate_limiter: ctx.prefill_rate_limiter.clone(),
+            queue_timeout_secs: ctx.router_config.queue_timeout_secs,
         })
     }
 
@@ -546,6 +582,18 @@ impl PDRouter {
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
 
+        if let Some(prefill_limiter) = &self.prefill_rate_limiter {
+            let timeout = std::time::Duration::from_secs(self.queue_timeout_secs);
+            if prefill_limiter.acquire_timeout(1.0, timeout).await.is_err() {
+                return error::request_timeout(
+                    "prefill_queue_timeout",
+                    "Request timed out waiting for prefill slot",
+                );
+            }
+        }
+        let mut prefill_limiter_guard =
+            PrefillLimiterGuard::new(self.prefill_rate_limiter.as_deref());
+
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -576,8 +624,21 @@ impl PDRouter {
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let mut prefill_send = std::pin::pin!(prefill_request.send());
+        let mut decode_send = std::pin::pin!(decode_request.send());
+
+        let (prefill_result, decode_result) = tokio::select! {
+            prefill_result = &mut prefill_send => {
+                prefill_limiter_guard.release_now("prefill_finished_first");
+                let decode_result = decode_send.await;
+                (prefill_result, decode_result)
+            }
+            decode_result = &mut decode_send => {
+                let prefill_result = prefill_send.await;
+                prefill_limiter_guard.release_now("decode_finished_first_prefill_later");
+                (prefill_result, decode_result)
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -1414,6 +1475,8 @@ impl RouterTrait for PDRouter {
 mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::middleware::TokenBucket;
+    use tokio::time::Duration;
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1427,6 +1490,8 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            prefill_rate_limiter: None,
+            queue_timeout_secs: 60,
         }
     }
 
@@ -1513,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
-        use tokio::time::{sleep, Duration};
+        use tokio::time::sleep;
 
         let router = create_test_pd_router();
 
@@ -1575,5 +1640,68 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_limiter_guard_releases_on_drop() {
+        let limiter = TokenBucket::new(1, 0);
+        limiter
+            .acquire_timeout(1.0, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        {
+            let _guard = PrefillLimiterGuard::new(Some(&limiter));
+        }
+
+        // After guard drop, token should be available again.
+        assert!(limiter
+            .acquire_timeout(1.0, Duration::from_millis(10))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prefill_limiter_guard_release_now_idempotent() {
+        let limiter = TokenBucket::new(1, 0);
+        limiter
+            .acquire_timeout(1.0, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        let mut guard = PrefillLimiterGuard::new(Some(&limiter));
+        guard.release_now("unit_test_manual");
+        guard.release_now("unit_test_manual_again");
+        drop(guard);
+
+        // Should still have exactly one token available (no over-release).
+        let available = limiter.available_tokens().await;
+        assert!((available - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_limiter_guard_drop_unblocks_waiter() {
+        let limiter = Arc::new(TokenBucket::new(1, 0));
+        limiter
+            .acquire_timeout(1.0, Duration::from_millis(10))
+            .await
+            .unwrap();
+
+        let waiter_limiter = limiter.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_limiter
+                .acquire_timeout(1.0, Duration::from_millis(100))
+                .await
+                .is_ok()
+        });
+
+        // waiter should block until token is returned
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        {
+            let _guard = PrefillLimiterGuard::new(Some(&limiter));
+        } // Drop returns token and should wake waiter
+
+        assert!(waiter.await.unwrap());
     }
 }

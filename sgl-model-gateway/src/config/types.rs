@@ -30,6 +30,9 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
+    /// Set to -1 to disable prefill stage concurrency limiting in PD mode
+    #[serde(default = "default_max_prefill_concurrent_requests")]
+    pub max_prefill_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
@@ -117,6 +120,10 @@ fn default_enable_l1() -> bool {
 
 fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
+}
+
+fn default_max_prefill_concurrent_requests() -> i32 {
+    -1
 }
 
 impl TokenizerCacheConfig {
@@ -493,6 +500,7 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: -1,
+            max_prefill_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,

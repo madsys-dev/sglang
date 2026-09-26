@@ -194,6 +194,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn max_prefill_concurrent_requests(mut self, max: i32) -> Self {
+        self.config.max_prefill_concurrent_requests = max;
+        self
+    }
+
     pub fn disable_rate_limiting(mut self) -> Self {
         self.config.max_concurrent_requests = -1;
         self
